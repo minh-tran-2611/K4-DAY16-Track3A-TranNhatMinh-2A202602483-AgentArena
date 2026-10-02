@@ -61,7 +61,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import is_degraded  # noqa: F401  (dùng trong phần TODO)
+from arena.model import is_degraded
 
 from harness.middleware import Middleware
 
@@ -70,6 +70,9 @@ DEFAULT_MAX_ATTEMPTS = 3
 
 #: Số lượt để dành cho `submit` mà agent vẫn còn phải gọi.
 DEFAULT_RESERVE = 1
+
+#: Lỗi TẤT ĐỊNH: gọi lại y hệt chắc chắn hỏng y hệt, chỉ tốn ngân sách.
+PERMANENT_ERRORS = ("doc not found:", "invalid expression:", "unknown tool:", "budget exhausted:")
 
 
 class Retry(Middleware):
@@ -85,17 +88,30 @@ class Retry(Middleware):
         self.max_attempts = max(1, int(max_attempts))
         self.reserve = max(0, int(reserve))
 
+    def _broken(self, result) -> bool:
+        return (not result.ok) or is_degraded(result.content or "")
+
+    def _worth_retrying(self, result) -> bool:
+        error = result.error or ""
+        return not any(error.startswith(marker) for marker in PERMANENT_ERRORS)
+
+    def _budget_left(self, ctx) -> bool:
+        limit = ctx.max_tool_calls
+        return limit is None or ctx.tools.calls < limit - self.reserve
+
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§7): khoảng 8-12 dòng.
-        #  1. Trong khi số lần đã thử < self.max_attempts VÀ kết quả còn
-        #     hỏng — tức `(not result.ok) or is_degraded(result.content)` —
-        #     thì gọi lại `call(name, args)` với ĐÚNG name/args cũ.
-        #  2. DỪNG THỬ LẠI khi ngân sách đã cạn: nếu
-        #     `ctx.max_tool_calls` khác None và
-        #     `ctx.tools.calls >= ctx.max_tool_calls - self.reserve`
-        #     thì đừng gọi thêm lượt nào nữa (xem phần cảnh báo ở trên).
-        #  3. Trả về kết quả cuối cùng (kể cả khi vẫn hỏng: agent phải
-        #     nhìn thấy sự thật, đừng bịa nội dung thay nó).
-        #  4. Ghi số lần đã thử vào ctx.state để gỡ lỗi.
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        attempts = 1
+        while (
+            attempts < self.max_attempts
+            and self._broken(result)
+            and self._worth_retrying(result)
+            and self._budget_left(ctx)
+        ):
+            result = call(name, args)
+            attempts += 1
+        ctx.state["retry_extra_calls"] = ctx.state.get("retry_extra_calls", 0) + attempts - 1
+        if self._broken(result):
+            ctx.state["retry_gave_up"] = ctx.state.get("retry_gave_up", 0) + 1
+        # Vẫn hỏng thì trả nguyên sự thật cho agent, không bịa nội dung.
+        return result

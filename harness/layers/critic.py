@@ -70,7 +70,20 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._evidence import norm, note_tool_call, source_of, sync_citations, trimmed
 from harness.middleware import Middleware
+
+#: Chỗ mô hình dán hai nguồn mâu thuẫn thành một câu (trường hợp (c)).
+JOINER = " và "
+
+ABSTAIN_ANSWER = (
+    "Không đủ căn cứ: các tài liệu đã đọc không chứa bằng chứng nguyên văn "
+    "để trả lời câu hỏi này, nên tôi không đưa ra số liệu hay kết luận."
+)
+CONFLICT_ANSWER = (
+    "Các tài liệu nội bộ MÂU THUẪN nhau về điểm này, nên không đủ căn cứ để "
+    "chọn một kết luận duy nhất. Một nguồn nêu: «{left}». Nguồn khác nêu: «{right}»."
+)
 
 
 class Critic(Middleware):
@@ -78,17 +91,56 @@ class Critic(Middleware):
 
     name = "critic"
 
+    def wrap_tool_call(self, ctx, call, name, args):
+        result = call(name, args)
+        note_tool_call(ctx, name, args, result)  # tài liệu nào đã thực sự vào lượt chạy
+        return result
+
+    def _split(self, ctx, text):
+        """Tách câu ghép thành hai nửa, mỗi nửa thuộc MỘT tài liệu khác nhau."""
+        start = text.find(JOINER)
+        while start != -1:
+            left, right = trimmed(text[:start]), trimmed(text[start + len(JOINER):])
+            left_doc, right_doc = source_of(ctx, left), source_of(ctx, right)
+            if left_doc and right_doc and left_doc != right_doc:
+                return [{"text": left, "doc_id": left_doc}, {"text": right, "doc_id": right_doc}]
+            start = text.find(JOINER, start + 1)
+        return None
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            claims = []
+        kept, seen_texts, conflict = [], set(), None
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            text = claim["text"]
+            if source_of(ctx, text, claim.get("doc_id")) is None:
+                cut = trimmed(text)  # CẮT là hợp lệ: vẫn là chữ của mô hình
+                if cut != text and source_of(ctx, cut, claim.get("doc_id")):
+                    claim["text"] = text = cut
+                else:
+                    halves = self._split(ctx, text)
+                    if halves is None:
+                        continue  # bịa: xoá
+                    conflict = conflict or halves
+                    for half in halves:
+                        if norm(half["text"]) not in seen_texts:
+                            seen_texts.add(norm(half["text"]))
+                            kept.append(half)
+                    continue
+            if norm(text) not in seen_texts:
+                seen_texts.add(norm(text))
+                kept.append(claim)
+
+        ctx.state["critic_kept"] = len(kept)
+        report["claims"] = kept
+        if conflict:
+            report["abstain"] = True
+            report["answer"] = CONFLICT_ANSWER.format(left=conflict[0]["text"], right=conflict[1]["text"])
+        elif not kept:
+            report["abstain"] = True
+            report["answer"] = ABSTAIN_ANSWER
+        sync_citations(report)
+        return report

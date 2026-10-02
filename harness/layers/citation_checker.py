@@ -59,7 +59,21 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from arena.model import MockModel
+
+from harness.layers._evidence import note_tool_call, source_of, sync_citations
 from harness.middleware import Middleware
+
+#: Nối vào SYSTEM message khi chạy model thật. Đo trên gemini-3.6-flash:
+#: model chép đúng một câu nhưng dừng ở dấu chấm giữa dòng, nên phủ 5/11
+#: từ khoá của dữ kiện (< 60%) và recall = 0 dù claim SUPPORTED. Layer
+#: không được nối thêm chữ vào claim (NOT_FROM_MODEL), nên phải nói trước.
+QUOTE_GUIDANCE = (
+    "\n\nHƯỚNG DẪN TRÍCH DẪN: mỗi phần tử claims hãy chép TRỌN VẸN cả một dòng "
+    "của tài liệu chứa câu trả lời (từ đầu dòng tới cuối dòng, kể cả các câu "
+    "đứng sau dấu chấm trong cùng dòng đó), đúng từng ký tự, miễn là dưới 400 "
+    "ký tự. Không dừng ở giữa dòng."
+)
 
 
 class CitationChecker(Middleware):
@@ -67,17 +81,36 @@ class CitationChecker(Middleware):
 
     name = "citation_checker"
 
+    def before_model(self, ctx, messages):
+        # Mock trích sẵn trọn dòng; giữ đường mock byte-identical (token).
+        if isinstance(getattr(ctx.model, "inner", ctx.model), MockModel):
+            return messages
+        if not messages or messages[0].get("role") != "system":
+            return messages
+        # Bản sao mới: không dán vĩnh viễn vào lịch sử của agent.
+        system = dict(messages[0], content=str(messages[0].get("content", "")) + QUOTE_GUIDANCE)
+        return [system] + messages[1:]
+
+    def wrap_tool_call(self, ctx, call, name, args):
+        result = call(name, args)
+        note_tool_call(ctx, name, args, result)  # tài liệu nào đã thực sự vào lượt chạy
+        return result
+
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+        moved = 0
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            cited = claim.get("doc_id")
+            # `source_of` thử chính `cited` trước: trích đúng rồi thì giữ.
+            source = source_of(ctx, claim["text"], cited)
+            if source is not None and source != cited:
+                claim["doc_id"] = source  # GẮN LẠI — chữ giữ nguyên
+                moved += 1
+            # Không tìm được nguồn: đó là bịa, để `critic` xoá.
+        ctx.state["citations_moved"] = moved
+        sync_citations(report)
+        return report

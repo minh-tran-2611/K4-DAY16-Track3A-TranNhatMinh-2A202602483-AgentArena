@@ -47,6 +47,12 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+import json
+
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
+
+from harness.layers._evidence import sync_citations
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
@@ -60,19 +66,59 @@ class InjectionGuard(Middleware):
 
     name = "injection_guard"
 
+    @staticmethod
+    def _quarantine(text: str) -> str:
+        """Thay mọi đoạn BLOCK_START..BLOCK_END bằng PLACEHOLDER.
+
+        Không có dấu mốc đóng (fetch bị cắt giữa chừng) thì cắt tới hết
+        chuỗi. Cuối cùng gỡ luôn canary trơn, phòng tài liệu độc không có
+        dấu mốc nào.
+        """
+        while BLOCK_START in text:
+            start = text.index(BLOCK_START)
+            end = text.find(BLOCK_END, start)
+            stop = len(text) if end == -1 else end + len(BLOCK_END)
+            text = text[:start] + PLACEHOLDER + text[stop:]
+        return text.replace(INJECTION_CANARY, PLACEHOLDER)
+
+    def _clean(self, name: str, content: str) -> str:
+        if name == "search":
+            # Làm sạch TỪNG snippet: cắt "tới hết chuỗi" trên cả khối JSON
+            # sẽ xoá luôn các kết quả search đứng sau tài liệu độc.
+            try:
+                hits = json.loads(content)
+            except ValueError:
+                hits = None
+            if isinstance(hits, list):
+                for hit in hits:
+                    if isinstance(hit, dict):
+                        for key, value in hit.items():
+                            if isinstance(value, str):
+                                hit[key] = self._quarantine(value)
+                return json.dumps(hits, ensure_ascii=False)
+        return self._quarantine(content)
+
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        content = result.content if isinstance(result.content, str) else ""
+        if BLOCK_START not in content and INJECTION_CANARY not in content:
+            return result
+        ctx.state["injection_quarantined"] = ctx.state.get("injection_quarantined", 0) + 1
+        return ToolResult(ok=result.ok, content=self._clean(name, content), error=result.error)
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        answer = report.get("answer")
+        if isinstance(answer, str) and INJECTION_CANARY in answer:
+            report["answer"] = answer.replace(INJECTION_CANARY, "").strip()
+        # Canary được dò trên TOÀN BỘ report. Claim thì không được sửa chữ,
+        # nên claim nào dính canary bị XOÁ (hợp lệ), không bị "làm sạch".
+        claims = report.get("claims")
+        if isinstance(claims, list):
+            clean = [c for c in claims if INJECTION_CANARY not in json.dumps(c, ensure_ascii=False, default=str)]
+            if len(clean) != len(claims):
+                report["claims"] = clean
+                sync_citations(report)
+        for key, value in list(report.items()):
+            if key not in ("answer", "claims") and INJECTION_CANARY in json.dumps(value, ensure_ascii=False, default=str):
+                report[key] = json.loads(json.dumps(value, ensure_ascii=False, default=str).replace(INJECTION_CANARY, ""))
+        return report
